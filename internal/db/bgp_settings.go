@@ -14,9 +14,23 @@ import (
 )
 
 const (
-	BGPDefaultEnabled = false
-	BGPDefaultLocalAS = 64512
+	BGPDefaultEnabled       = false
+	BGPDefaultLocalAS       = 64512
+	BGPDefaultRouterID      = ""
+	BGPDefaultListenAddress = ":179"
 )
+
+// defaultBGPSettings is the single source of truth for the documented
+// BGP defaults. InitializeBGPSettings seeds the singleton row with these
+// values when the table is empty.
+func defaultBGPSettings() *BGPSettings {
+	return &BGPSettings{
+		Enabled:       BGPDefaultEnabled,
+		LocalAS:       BGPDefaultLocalAS,
+		RouterID:      BGPDefaultRouterID,
+		ListenAddress: BGPDefaultListenAddress,
+	}
+}
 
 const BGPSettingsTableName = "bgp_settings"
 
@@ -36,8 +50,9 @@ type BGPSettings struct {
 	ListenAddress string `db:"listenAddress"`
 }
 
-// InitializeBGPSettings inserts the default BGP settings into the database.
-// If the settings already exist, it does nothing.
+// InitializeBGPSettings inserts the default BGP settings row if the
+// singleton row does not yet exist. Idempotent: an existing row (whether
+// holding the default or an operator-set value) is left untouched.
 func (db *Database) InitializeBGPSettings(ctx context.Context) error {
 	_, err := db.GetBGPSettings(ctx)
 	if err == nil {
@@ -48,12 +63,7 @@ func (db *Database) InitializeBGPSettings(ctx context.Context) error {
 		return fmt.Errorf("failed to check BGP settings: %w", err)
 	}
 
-	return db.UpdateBGPSettings(ctx, &BGPSettings{
-		Enabled:       BGPDefaultEnabled,
-		LocalAS:       BGPDefaultLocalAS,
-		RouterID:      "",
-		ListenAddress: ":179",
-	})
+	return db.UpdateBGPSettings(ctx, defaultBGPSettings())
 }
 
 func (db *Database) GetBGPSettings(ctx context.Context) (*BGPSettings, error) {
@@ -116,7 +126,7 @@ func (db *Database) UpdateBGPSettings(ctx context.Context, settings *BGPSettings
 
 	DBQueriesTotal.WithLabelValues(BGPSettingsTableName, "update").Inc()
 
-	_, err := opUpdateBGPSettings.Invoke(db, settings)
+	_, err := db.applyUpdateBGPSettings(ctx, settings)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -124,6 +134,7 @@ func (db *Database) UpdateBGPSettings(ctx context.Context, settings *BGPSettings
 		return err
 	}
 
+	db.publishOpTopics([]Topic{TopicBGPSettings}, 0)
 	span.SetStatus(codes.Ok, "")
 
 	return nil

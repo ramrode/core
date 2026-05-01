@@ -32,8 +32,9 @@ type NATSettings struct {
 	Enabled bool `db:"enabled"`
 }
 
-// InitializeNATSettings inserts the default NAT settings into the database.
-// If the settings already exist, it does nothing.
+// InitializeNATSettings inserts the default NAT settings row if the
+// singleton row does not yet exist. Idempotent: an existing row (whether
+// holding the default or an operator-set value) is left untouched.
 func (db *Database) InitializeNATSettings(ctx context.Context) error {
 	_, err := db.IsNATEnabled(ctx)
 	if err == nil {
@@ -98,7 +99,7 @@ func (db *Database) UpdateNATSettings(ctx context.Context, enabled bool) error {
 
 	DBQueriesTotal.WithLabelValues(NATSettingsTableName, "update").Inc()
 
-	_, err := opUpdateNATSettings.Invoke(db, &boolPayload{Value: enabled})
+	_, err := db.applyUpdateNATSettings(ctx, &boolPayload{Value: enabled})
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -106,6 +107,7 @@ func (db *Database) UpdateNATSettings(ctx context.Context, enabled bool) error {
 		return err
 	}
 
+	db.publishOpTopics([]Topic{TopicNATSettings}, 0)
 	span.SetStatus(codes.Ok, "")
 
 	return nil

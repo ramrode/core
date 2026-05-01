@@ -222,16 +222,19 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 	secureCookie := resolveScheme(s.cfg) == HTTPS
 
 	fullHandler := server.NewHandler(server.HandlerConfig{
-		DB:                  opts.DB,
-		Config:              s.cfg,
-		JWTSecret:           jwtSecret,
-		SecureCookie:        secureCookie,
-		FrontendFS:          opts.EmbedFS,
-		Sessions:            opts.Sessions,
-		AMF:                 opts.AMF,
-		BGP:                 opts.BGP,
-		BcryptCost:          bcrypt.DefaultCost,
-		Ready:               &s.ready,
+		DB:           opts.DB,
+		Config:       s.cfg,
+		JWTSecret:    jwtSecret,
+		SecureCookie: secureCookie,
+		FrontendFS:   opts.EmbedFS,
+		Sessions:     opts.Sessions,
+		AMF:          opts.AMF,
+		BGP:          opts.BGP,
+		BcryptCost:   bcrypt.DefaultCost,
+		Ready:        &s.ready,
+		ReconcileRoutes: func(rcCtx context.Context) error {
+			return routeReconciler(rcCtx, opts.DB, kernelInt)
+		},
 		RegisterExtraRoutes: opts.RegisterExtraRoutes,
 		ClusterListener:     opts.ClusterListener,
 	})
@@ -251,9 +254,6 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 	reconcile := routeReconciler
 
 	go func() {
-		sub := opts.DB.Changefeed().Subscribe(db.TopicRoutes)
-		defer sub.Close()
-
 		runReconcile := func() {
 			if err := reconcile(ctx, opts.DB, kernelInt); err != nil {
 				logger.APILog.Error("couldn't reconcile routes", zap.Error(err))
@@ -269,10 +269,6 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 			select {
 			case <-ctx.Done():
 				return
-			case <-sub.Events:
-				runReconcile()
-			case <-sub.Dropped:
-				runReconcile()
 			case <-backstop.C:
 				runReconcile()
 			}
@@ -280,7 +276,7 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 	}()
 
 	if opts.BGP != nil {
-		bgpStore := &bgpSettingsStoreAdapter{db: opts.DB}
+		bgpStore := &bgpSettingsStoreAdapter{db: opts.DB, cfg: s.cfg}
 		filterBuilder := func(fbCtx context.Context) (*bgp.RouteFilter, error) {
 			pools := server.CollectUEPools(fbCtx, opts.DB)
 			n3Addr, _ := netip.ParseAddr(s.cfg.Interfaces.N3.Address)
@@ -296,7 +292,7 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 		)
 
 		bgpReconciler := bgp.NewSettingsReconciler(opts.BGP, bgpStore, filterBuilder, bgpSettingsWakeup)
-		seedReconcilerFromCurrentState(ctx, bgpReconciler, opts.DB)
+		seedReconcilerFromCurrentState(ctx, bgpReconciler, bgpStore)
 		bgpReconciler.Start()
 
 		go func() {
@@ -313,7 +309,8 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 // converting from the DB row types into the BGP service's own types
 // so the bgp package does not depend on db.
 type bgpSettingsStoreAdapter struct {
-	db *db.Database
+	db  *db.Database
+	cfg config.Config
 }
 
 func (a *bgpSettingsStoreAdapter) GetSettings(ctx context.Context) (bgp.BGPSettings, error) {
@@ -322,7 +319,26 @@ func (a *bgpSettingsStoreAdapter) GetSettings(ctx context.Context) (bgp.BGPSetti
 		return bgp.BGPSettings{}, err
 	}
 
-	return server.DBSettingsToBGPSettings(settings), nil
+	return a.withLocalBGPDefaults(settings), nil
+}
+
+func (a *bgpSettingsStoreAdapter) withLocalBGPDefaults(settings *db.BGPSettings) bgp.BGPSettings {
+	out := server.DBSettingsToBGPSettings(settings)
+	n3Addr := a.cfg.Interfaces.N3.Address
+
+	if out.RouterID == "" {
+		out.RouterID = n3Addr
+	}
+
+	if out.ListenAddress == "" {
+		if n3Addr == "" {
+			out.ListenAddress = ":179"
+		} else {
+			out.ListenAddress = net.JoinHostPort(n3Addr, "179")
+		}
+	}
+
+	return out
 }
 
 func (a *bgpSettingsStoreAdapter) ListPeers(ctx context.Context) ([]bgp.BGPPeer, error) {
@@ -338,23 +354,23 @@ func (a *bgpSettingsStoreAdapter) IsNATEnabled(ctx context.Context) (bool, error
 	return a.db.IsNATEnabled(ctx)
 }
 
-func seedReconcilerFromCurrentState(ctx context.Context, r *bgp.SettingsReconciler, dbInstance *db.Database) {
-	settings, err := dbInstance.GetBGPSettings(ctx)
+func seedReconcilerFromCurrentState(ctx context.Context, r *bgp.SettingsReconciler, store *bgpSettingsStoreAdapter) {
+	settings, err := store.db.GetBGPSettings(ctx)
 	if err != nil {
 		return
 	}
 
-	dbPeers, err := dbInstance.ListAllBGPPeers(ctx)
+	dbPeers, err := store.db.ListAllBGPPeers(ctx)
 	if err != nil {
 		return
 	}
 
-	natEnabled, err := dbInstance.IsNATEnabled(ctx)
+	natEnabled, err := store.db.IsNATEnabled(ctx)
 	if err != nil {
 		return
 	}
 
-	r.MarkApplied(server.DBSettingsToBGPSettings(settings), server.DBPeersToBGPPeers(dbPeers), !natEnabled)
+	r.MarkApplied(store.withLocalBGPDefaults(settings), server.DBPeersToBGPPeers(dbPeers), !natEnabled)
 }
 
 // Handler returns the swappable HTTP handler backing the API server.
